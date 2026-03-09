@@ -1,0 +1,4 @@
+Log file created at: 2026/03/04 21:07:12
+Running on machine: ubuntu
+Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg
+E0304 21:07:12.407408  8586 MVCAMAPI.cpp:350] CameraInit Failed, err:-14,Version:2.1.0.37,FriendlyName:MV-GE231GM-T#C0A803EE,SN:055062923092

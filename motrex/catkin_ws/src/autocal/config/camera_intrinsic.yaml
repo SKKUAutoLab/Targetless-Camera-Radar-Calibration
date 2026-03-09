@@ -1,0 +1,67 @@
+# camera_intrinsic.yaml
+# 카메라 스펙 및 캘리브레이션 파라미터 설정.
+
+camera_spec:
+  manufacturer: MindVision
+  model: MV-GE231GC-M
+  interface: GigE
+  sensor: 1/1.2" CMOS
+  shutter: global
+  resolution:
+    width: 1920
+    height: 1200
+  max_fps: 40.25
+stream:
+  target_fps: 30.0
+  encoding: bgr8
+frames:
+  camera_frame: camera_link
+  camera_optical_frame: camera_optical_frame
+topics:
+  image: /camera/image_raw
+  camera_info: /camera/camera_info
+camera_info:
+  distortion_model: plumb_bob
+  D:
+  - -0.25396217493505846
+  - 2.2265072450981807
+  - 0.05911083101044734
+  - -0.00022021034540089686
+  - -8.076007250197167
+  K:
+  - 4106.488206547475
+  - 0.0
+  - 983.5401190689403
+  - 0.0
+  - 4292.0600475757055
+  - 1418.7449342953119
+  - 0.0
+  - 0.0
+  - 1.0
+  R:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  P:
+  - 4106.488206547475
+  - 0.0
+  - 983.5401190689403
+  - 0.0
+  - 0.0
+  - 4292.0600475757055
+  - 1418.7449342953119
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0
+notes:
+- "JSON \uB370\uC774\uD130\uC5D0\uC11C \uCD94\uCD9C\uD55C \uCD5C\uC2E0 \uCE98\uB9AC\
+  \uBE0C\uB808\uC774\uC158 \uAC12\uC73C\uB85C \uC5C5\uB370\uC774\uD2B8\uB418\uC5C8\
+  \uC2B5\uB2C8\uB2E4."

@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+역할:
+- 오프라인 bag 파일을 읽어 카메라 이미지/레이더 포인트클라우드를 실시간 재생처럼 재발행한다.
+- intrinsic JSON을 읽어 `CameraInfo`를 구성하고 영상과 함께 발행해 후단 노드가 온라인과 동일하게 동작하도록 만든다.
+- `offline_sources.json`의 source 프로파일을 적용해 bag 경로/토픽 매핑을 선택적으로 전환할 수 있다.
+
+입력:
+- `~sources_json` (`json`): 오프라인 소스 프로파일 파일 경로.
+- `~source_name` (`str`): 선택할 소스 이름.
+- `~bag_path`, `~intrinsic_path` (`str`): bag/intrinsic 파일 경로.
+- `~bag_*_topic`, `~out_*_topic` (`str`): 입력 bag 토픽과 출력 토픽 매핑.
+
+출력:
+- `~out_image_topic` (`sensor_msgs/Image`): 재생 이미지 토픽.
+- `~out_radar_topic` (`sensor_msgs/PointCloud2`): 재생 레이더 토픽.
+- `~out_info_topic` (`sensor_msgs/CameraInfo`): 카메라 내부파라미터 토픽.
+"""
+
+import json
+import os
+import time
+
+import rosbag
+import rospy
+from rospkg import RosPack
+from rosbag.bag import ROSBagException, ROSBagFormatException, ROSBagUnindexedException
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+
+# ---------------------------------------------------------
+# 오프라인 재생 파라미터
+# ---------------------------------------------------------
+DEFAULT_SOURCE_NAME = ""                              # offline_sources에서 사용할 소스 이름
+DEFAULT_BAG_IMAGE_TOPIC = "/camera/image_raw"         # bag 내부 이미지 토픽
+DEFAULT_BAG_RADAR_TOPIC = "/point_cloud"              # bag 내부 레이더 토픽
+DEFAULT_OUT_IMAGE_TOPIC = "/camera/image_raw"         # 재발행 이미지 토픽
+DEFAULT_OUT_RADAR_TOPIC = "/point_cloud"              # 재발행 레이더 토픽
+DEFAULT_OUT_INFO_TOPIC = "/camera/camera_info"        # 재발행 CameraInfo 토픽
+DEFAULT_PLAYBACK_RATE = 1.0                           # 재생 속도 배율(>1 빠르게, <1 느리게)
+DEFAULT_MAX_SLEEP_SEC = 0.10                          # 메시지 간 최대 대기시간(초)
+DEFAULT_ALLOW_TIME_REWIND = False                     # bag timestamp 역행 구간 허용 여부
+
+
+def _resolve_ros_path(path: str) -> str:
+    """
+    `$(find autocal)` 경로 패턴을 실제 절대 경로로 치환
+    """
+    if not isinstance(path, str):
+        return path
+    if "$(find autocal)" in path:
+        rp = RosPack()
+        return path.replace("$(find autocal)", rp.get_path("autocal"))
+    return path
+
+
+class OfflineProvider:
+    def __init__(self):
+        """
+        오프라인 소스 설정, 토픽 매핑, 퍼블리셔, CameraInfo를 초기화
+        """
+        rospy.init_node("offline_provider", anonymous=False)
+
+        r = RosPack()
+        pkg_path = r.get_path("autocal")
+
+        # 소스 JSON 및 기본 경로 파라미터 로드
+        default_sources_json = os.path.join(pkg_path, "config", "offline_sources.json")
+        self.sources_json = _resolve_ros_path(rospy.get_param("~sources_json", default_sources_json))
+        self.source_name = rospy.get_param("~source_name", DEFAULT_SOURCE_NAME)
+
+        default_source_cfg = self._get_default_source_config()
+        default_bag_path = _resolve_ros_path(default_source_cfg.get("bag_path", ""))
+        default_intrinsic_path = os.path.join(pkg_path, "config", "intrinsic.json")
+
+        self.bag_path = _resolve_ros_path(rospy.get_param("~bag_path", default_bag_path))
+        self.intrinsic_path = _resolve_ros_path(rospy.get_param("~intrinsic_path", default_intrinsic_path))
+
+        # bag 토픽과 출력 토픽 매핑 로드
+        self.bag_image_topic = rospy.get_param("~bag_image_topic", DEFAULT_BAG_IMAGE_TOPIC)
+        self.bag_radar_topic = rospy.get_param("~bag_radar_topic", DEFAULT_BAG_RADAR_TOPIC)
+        self.out_image_topic = rospy.get_param("~out_image_topic", DEFAULT_OUT_IMAGE_TOPIC)
+        self.out_radar_topic = rospy.get_param("~out_radar_topic", DEFAULT_OUT_RADAR_TOPIC)
+        self.out_info_topic = rospy.get_param("~out_info_topic", DEFAULT_OUT_INFO_TOPIC)
+
+        # 재생 타이밍 제어 파라미터
+        self.playback_rate = max(1e-3, float(rospy.get_param("~playback_rate", DEFAULT_PLAYBACK_RATE)))
+        self.max_sleep_sec = max(0.0, float(rospy.get_param("~max_sleep_sec", DEFAULT_MAX_SLEEP_SEC)))
+        self.allow_time_rewind = bool(rospy.get_param("~allow_time_rewind", DEFAULT_ALLOW_TIME_REWIND))
+
+        # source_name이 있으면 JSON 프로파일로 덮어쓰기
+        self._apply_source_config_from_json()
+
+        # 퍼블리셔 초기화
+        self.pub_img = rospy.Publisher(self.out_image_topic, Image, queue_size=10)
+        self.pub_radar = rospy.Publisher(self.out_radar_topic, PointCloud2, queue_size=10)
+        self.pub_info = rospy.Publisher(self.out_info_topic, CameraInfo, queue_size=10)
+
+        rospy.loginfo(f"[OfflineProvider] Loading CameraInfo: {self.intrinsic_path}")
+        self.camera_info = self.load_camera_info(self.intrinsic_path)
+        rospy.loginfo(
+            f"[OfflineProvider] timing config: playback_rate={self.playback_rate:.3f}, "
+            f"max_sleep_sec={self.max_sleep_sec:.3f}, allow_time_rewind={self.allow_time_rewind}"
+        )
+
+        if bool(rospy.get_param("/use_sim_time", False)):
+            rospy.logwarn(
+                "[OfflineProvider] /use_sim_time is true. "
+                "This node replays with wall-clock timing; leave /use_sim_time false when not using rosbag --clock."
+            )
+
+    def _apply_source_config_from_json(self):
+        """
+        offline_sources.json에서 선택 소스 설정을 로드해 경로/토픽을 덮어쓰기
+        """
+        if not os.path.exists(self.sources_json):
+            rospy.logwarn(f"[OfflineProvider] sources_json not found: {self.sources_json}")
+            return
+
+        try:
+            with open(self.sources_json, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            sources = payload.get("sources", {}) if isinstance(payload, dict) else {}
+            selected = self.source_name or payload.get("active_source", "")
+            if not selected:
+                return
+
+            src = sources.get(selected)
+            if not isinstance(src, dict):
+                rospy.logwarn(f"[OfflineProvider] source '{selected}' not found")
+                return
+
+            self.bag_path = _resolve_ros_path(src.get("bag_path", self.bag_path))
+            self.intrinsic_path = _resolve_ros_path(src.get("intrinsic_path", self.intrinsic_path))
+            self.bag_image_topic = src.get("bag_image_topic", self.bag_image_topic)
+            self.bag_radar_topic = src.get("bag_radar_topic", self.bag_radar_topic)
+            self.out_image_topic = src.get("out_image_topic", self.out_image_topic)
+            self.out_radar_topic = src.get("out_radar_topic", self.out_radar_topic)
+            self.out_info_topic = src.get("out_info_topic", self.out_info_topic)
+
+            rospy.loginfo(f"[OfflineProvider] Loaded source '{selected}'")
+
+        except Exception as exc:
+            rospy.logwarn(f"[OfflineProvider] Failed to load sources_json: {exc}")
+
+    def _get_default_source_config(self) -> dict:
+        """
+        offline_sources.json의 active_source(또는 source_name)를 읽어 기본 경로/토픽 설정 반환
+        """
+        if not os.path.exists(self.sources_json):
+            return {}
+
+        try:
+            with open(self.sources_json, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            if not isinstance(payload, dict):
+                return {}
+
+            sources = payload.get("sources", {})
+            if not isinstance(sources, dict):
+                return {}
+
+            selected = self.source_name or payload.get("active_source", "")
+            src = sources.get(selected, {}) if selected else {}
+            return src if isinstance(src, dict) else {}
+        except Exception as exc:
+            rospy.logwarn(f"[OfflineProvider] Failed to read default source config: {exc}")
+            return {}
+        
+    def load_camera_info(self, json_path: str) -> CameraInfo:
+        """
+        intrinsic JSON 내용을 CameraInfo 메시지로 변환
+        """
+        ci = CameraInfo()
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                calib_data = json.load(f)
+
+            image_size = calib_data.get("image_size", {}) if isinstance(calib_data, dict) else {}
+            ci.width = int(image_size.get("width", 1920))
+            ci.height = int(image_size.get("height", 1200))
+            ci.distortion_model = calib_data.get("distortion_model", "plumb_bob")
+
+            d = calib_data.get("D", [0.0] * 5)
+            k = calib_data.get("K", [[0.0] * 3 for _ in range(3)])
+            r = calib_data.get("R", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+            p = calib_data.get("P", [[0.0] * 4 for _ in range(3)])
+
+            ci.D = [float(x) for x in d]
+            ci.K = [float(x) for row in k for x in row]
+            ci.R = [float(x) for row in r for x in row]
+            ci.P = [float(x) for row in p for x in row]
+
+        except Exception as exc:
+            rospy.logwarn(f"[OfflineProvider] Failed to parse intrinsic json: {exc}")
+
+        return ci
+
+    def run(self):
+        """
+        bag 파일을 루프 재생하며 이미지/레이더/CameraInfo를 시각 동기화해 발행
+        """
+        if not self.bag_path:
+            rospy.logerr(
+                "[OfflineProvider] bag_path is empty. "
+                "Set config/offline_sources.json active_source.bag_path or pass ~bag_path explicitly."
+            )
+            return
+        
+        if not os.path.exists(self.bag_path):
+            rospy.logerr(f"[OfflineProvider] Bag file not found: {self.bag_path}")
+            return
+
+        rospy.loginfo(f"[OfflineProvider] Start playback: {self.bag_path}")
+
+        while not rospy.is_shutdown():
+            try:
+                with rosbag.Bag(self.bag_path, mode="r", allow_unindexed=True) as bag:
+                    topic_info = bag.get_type_and_topic_info().topics
+                    available_topics = set(topic_info.keys())
+                    requested_topics = {self.bag_image_topic, self.bag_radar_topic}
+                    missing_topics = [t for t in requested_topics if t not in available_topics]
+                    if missing_topics:
+                        rospy.logerr(
+                            "[OfflineProvider] Requested bag topics not found. "
+                            f"missing={missing_topics}, available={sorted(available_topics)}"
+                        )
+                        return
+
+                    target_wall = None
+                    prev_ros_sec = None
+                    published_count = 0
+
+                    for topic, msg, t in bag.read_messages(topics=[self.bag_image_topic, self.bag_radar_topic]):
+                        if rospy.is_shutdown():
+                            break
+
+                        curr_ros_sec = t.to_sec()
+                        now_wall = time.time()
+
+                        if target_wall is None:
+                            target_wall = now_wall
+                            prev_ros_sec = curr_ros_sec
+
+                        delta_ros = curr_ros_sec - prev_ros_sec
+                        if delta_ros < 0.0 and not self.allow_time_rewind:
+                            rospy.logwarn_throttle(
+                                5.0,
+                                f"[OfflineProvider] Bag timestamp moved backward (dt={delta_ros:.3f}s). "
+                                "Clamp to 0. Set ~allow_time_rewind:=true to allow backward jumps."
+                            )
+                            delta_ros = 0.0
+
+                        # bag 시간 간격을 재생배율로 스케일하고, 큰 공백 구간은 상한으로 제한해 끊김 완화
+                        delta_wall = max(0.0, delta_ros / self.playback_rate)
+                        if self.max_sleep_sec > 0.0:
+                            delta_wall = min(delta_wall, self.max_sleep_sec)
+
+                        target_wall += delta_wall
+                        sleep_dt = target_wall - now_wall
+                        if sleep_dt > 0:
+                            time.sleep(sleep_dt)
+
+                        prev_ros_sec = curr_ros_sec
+
+                        # 이미지/레이더가 동일한 재생 기준시각을 공유하도록 목표 시각으로 stamp 고정
+                        stamp = rospy.Time.from_sec(target_wall)
+
+                        if topic == self.bag_image_topic:
+                            msg.header.stamp = stamp
+                            self.camera_info.header = msg.header
+                            self.pub_img.publish(msg)
+                            self.pub_info.publish(self.camera_info)
+                            published_count += 1
+                        elif topic == self.bag_radar_topic:
+                            msg.header.stamp = stamp
+                            self.pub_radar.publish(msg)
+                            published_count += 1
+
+                    if published_count == 0:
+                        rospy.logwarn(
+                            "[OfflineProvider] No messages were replayed in this pass. "
+                            "Check bag topics and filters."
+                        )
+                        time.sleep(1.0)
+            except ROSBagUnindexedException:
+                rospy.logerr(
+                    f"[OfflineProvider] Bag is unindexed: {self.bag_path}. "
+                    f"Run: rosbag reindex {self.bag_path}"
+                )
+                return
+            except ROSBagFormatException as exc:
+                rospy.logerr(f"[OfflineProvider] Invalid/corrupted bag format: {self.bag_path} ({exc})")
+                return
+            except ROSBagException as exc:
+                rospy.logerr(f"[OfflineProvider] Failed to read bag: {self.bag_path} ({exc})")
+                return
+
+            rospy.loginfo("[OfflineProvider] Replaying bag from beginning")
+
+
+if __name__ == "__main__":
+    try:
+        node = OfflineProvider()
+        node.run()
+    except rospy.ROSInterruptException:
+        pass
